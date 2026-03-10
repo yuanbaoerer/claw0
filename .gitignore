@@ -18,3 +18,6 @@ workspace/delivery-queue/
 # OS
 .DS_Store
 Thumbs.db
+
+.idea/
+*.iml
