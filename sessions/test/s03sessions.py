@@ -437,7 +437,49 @@ class ContextGuard:
             第1次尝试：截断过大的工具结果
             第2次尝试：通过 LLM 摘要压缩历史
         """
+        current_messages = messages
 
+        for attempt in range(max_retries + 1):
+            try:
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "max_tokens": 8096,
+                    "system": system,
+                    "messages": current_messages,
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                result = api_client.messages.create(**kwargs)
+                if current_messages is not messages:
+                    messages.clear()
+                    messages.extend(current_messages)
+                return result
+
+            except Exception as exc:
+                error_str = str(exc).lower()
+                is_overflow = ("context" in error_str or "token" in error_str)
+
+                if not is_overflow or attempt >= max_retries:
+                    raise
+
+                if attempt == 0:
+                    print_warn(
+                        "  [guard] Context overflow detected,"
+                        "truncating large tool results..."
+                    )
+                    current_messages = self._truncate_large_tool_results(
+                        current_messages
+                    )
+                elif attempt == 1:
+                    print_warn(
+                        "  [guard] Still overflowing, "
+                        "compacting conversation history..."
+                    )
+                    current_messages = self.compact_history(
+                        current_messages, api_client, model
+                    )
+
+        raise RuntimeError("guard_api_call: exhausted retries")
 
 
 
