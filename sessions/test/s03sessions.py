@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
+from certifi import contents
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
@@ -247,6 +248,198 @@ class SessionStore:
                         "content": [result_block],
                     })
         return messages
+
+    def list_sessions(self) -> list[tuple[str, dict]]:
+        items = list(self._index.items())
+        items.sort(key=lambda x: x[1].get("last_active", ""), reverse=True)
+        return items
+
+
+def _serialize_messages_for_summary(messages: list[dict]) -> str:
+    """将消息列表扁平化为纯文本，用于 LLM 摘要"""
+    parts: list[str] = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(f"[{role}]: {content}")
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        parts.append(f"[{role}]: {block['content']}")
+                    elif btype == "tool_use":
+                        parts.append(
+                            f"[{role} called {block.get('name', '?')}]: "
+                            f"{json.dumps(block.get('input', []), ensure_ascii=False)}"
+                        )
+                    elif btype == "tool_result":
+                        rc = block.get("content", "")
+                        preview = rc[:500] if isinstance(rc, str) else str(rc)[:500]
+                        parts.append(f"[tool_result]: {preview}")
+                elif hasattr(block, "text"):
+                    parts.append(f"[{role}]: {block.text}")
+    return "\n".join(parts)
+
+# ContextGuard 上下文溢出保护
+# 1. 截断过大的工具结果
+# 2. 将旧消息压缩为 LLM 生成的摘要（固定50%的比例）
+# 3. 仍然溢出则抛出异常
+
+class ContextGuard:
+    """保护agent免受上下文窗口溢出"""
+    def __init__(self, max_token: int = CONTEXT_SAFE_LIMIT):
+        self.max_token = max_token
+
+    @staticmethod
+    def estimate_tokens(text: str):
+        return len(text) // 4
+
+    def estimate_messages_tokens(self, messages: list[[dict]]) -> int:
+        """估算tokens"""
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += self.estimate_tokens(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if "text" in block:
+                            total += self.estimate_tokens(block["text"])
+                        elif block.get("type") == "tool_result":
+                            rc = block.get("content", "")
+                            if isinstance(rc, str):
+                                total += self.estimate_tokens(rc)
+                        elif block.get("type") == "tool_use":
+                            total += self.estimate_tokens(
+                                json.dumps(block.get("input", {})),
+                            )
+                    else:
+                        if hasattr(block, "text"):
+                            total += self.estimate_tokens(block.text)
+                        elif hasattr(block, "input"):
+                            total += self.estimate_tokens(
+                                json.dumps(block.input)
+                            )
+        return total
+
+    def truncate_tool_result(self, result: str, max_fraction: float = 0.3) -> str:
+        """在换行边界处只保留头部进行截断"""
+        max_chars = int(self.max_token * 4 * max_fraction)
+        if len(result) <= max_chars:
+            return result
+        cut = result.rfind("\n", 0, max_chars)
+        if cut <= 0:
+            cut = max_chars
+        head = result[:cut]
+        return head + f"\n\n[... truncated ({len(result)} chars total, showing first {len(head)}) ...]"
+
+
+    def compact_history(self, messages: list[dict],
+                        api_client: Anthropic, model: str) -> list[dict]:
+        """
+        将前 50% 的消息压缩为LLM生成的摘要
+        保留最后N条信息（N = max(4, total's 20%)）不变
+        """
+        total = len(messages)
+        if total <= 4:
+            return messages
+
+        keep_count = max(4, int(total * 0.2))
+        compress_count = max(2, int(total * 0.5))
+        compress_count = min(compress_count, total - keep_count)
+
+        if compress_count < 2:
+            return messages
+
+        old_messages = messages[:compress_count]
+        recent_messages = messages[compress_count:]
+
+        old_text = _serialize_messages_for_summary(old_messages)
+
+        summary_prompt = (
+            "Summarize the following conversation concisely, "
+            "preserving key facts and decisions."
+            "Output only the summary, no preamble.\n\n"
+            f"{old_text}"
+        )
+
+        try:
+            summary_resp = api_client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system="You are a conversation summarizer. Be concise and factual.",
+                messages=[{"role": "user", "content": summary_prompt}],
+            )
+            summary_text = ""
+            for block in summary_resp.content:
+                if hasattr(block, "text"):
+                    summary_text += block.text
+
+            print_session(
+                f" [compact] {len(old_messages)} messages -> summary"
+                f"({len(summary_text)} chars)"
+            )
+
+        except Exception as exc:
+            print_warn(f"  [compact] Summary failed ({exc}), dropping old messages")
+            return recent_messages
+
+        compacted = [
+            {
+                "role": "user",
+                "content": "[Previous conversation summary]\n" + summary_text,
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Understood, I have the context from our previous conversation."}]
+            },
+        ]
+        compacted.extend(recent_messages)
+        return compacted
+
+    def _truncate_large_tool_results(self, messages: list[dict]) -> list[dict]:
+        """遍历消息列表，截断过大的 tool_result 块"""
+        result = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                new_blocks = []
+                for block in content:
+                    if (isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                            and isinstance(block.get("content"), str)):
+                        block = dict(block)
+                        block["content"] = self.truncate_tool_result(
+                            block["content"]
+                        )
+                    new_blocks.append(block)
+                result.append({"role": msg["role"], "content": new_blocks})
+            else:
+                result.append(msg)
+        return result
+
+
+    def guard_api_call(
+            self,
+            api_client: Anthropic,
+            model: str,
+            system: str,
+            messages: list[dict],
+            tools: list[dict] | None = None,
+            max_retries: int = 2,
+    ) -> Any:
+        """
+        三阶段重试：
+            第0次尝试：正常调用
+            第1次尝试：截断过大的工具结果
+            第2次尝试：通过 LLM 摘要压缩历史
+        """
+
+
+
 
 
 
